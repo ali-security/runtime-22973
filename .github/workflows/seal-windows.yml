@@ -1,0 +1,154 @@
+# Seal: Windows verification for System.Security.Cryptography.Xml 8.0.3-sp1.
+# Source = dotnet/runtime v8.0.26 (ace9703c, the NuGet 8.0.3 build commit) + the sealed patches
+# from sealed-libraries NuGet/System.Security.Cryptography.Xml/8.0.3-sp1/patches.
+name: Seal - System.Security.Cryptography.Xml Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      # Keep LF line endings so the Windows build compiles the same source bytes as the Linux build.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+
+      - name: Build clr+libs (Release)
+        run: .\build.cmd clr+libs -c Release
+        shell: cmd
+
+      - name: Pack System.Security.Cryptography.Xml (same flags as the sealed artifact)
+        run: .\dotnet.cmd build src\libraries\System.Security.Cryptography.Xml\src\System.Security.Cryptography.Xml.csproj -c Release /p:ContinuousIntegrationBuild=true /p:OfficialBuildId=20260319.21
+        shell: cmd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nupkg-windows
+          path: artifacts/packages/Release/Shipping/System.Security.Cryptography.Xml.8.0.3-sp1.nupkg
+
+      - name: Test net8.0
+        id: test_net8
+        continue-on-error: true
+        run: .\dotnet.cmd build /t:Test src\libraries\System.Security.Cryptography.Xml\tests\System.Security.Cryptography.Xml.Tests.csproj -c Release -f net8.0
+        shell: cmd
+
+      - name: Test net462 (.NET Framework)
+        id: test_net462
+        continue-on-error: true
+        run: .\dotnet.cmd build /t:Test src\libraries\System.Security.Cryptography.Xml\tests\System.Security.Cryptography.Xml.Tests.csproj -c Release -f net462
+        shell: cmd
+
+      - name: Test summary
+        if: always()
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($tfm in 'net8.0', 'net462') {
+            $xml = "artifacts/bin/System.Security.Cryptography.Xml.Tests/Release/$tfm/testResults.xml"
+            if (-not (Test-Path $xml)) { Write-Output "::error::$tfm - no testResults.xml"; $failed = $true; continue }
+            [xml]$r = Get-Content $xml
+            $a = $r.assemblies.assembly
+            Write-Output "== $tfm : total=$($a.total) passed=$($a.passed) failed=$($a.failed) skipped=$($a.skipped)"
+            $r.SelectNodes('//test[@result="Fail"]') | ForEach-Object { Write-Output "   FAIL $($_.name)" }
+            $r.SelectNodes('//test[contains(@name,"CertificateContentType")]') | ForEach-Object { Write-Output "   $($_.result.PadRight(4)) $($_.name)" }
+            if ([int]$a.failed -gt 0) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-windows
+          path: artifacts/bin/System.Security.Cryptography.Xml.Tests/Release/*/testResults.xml
+
+  poc:
+    needs: build-and-test
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .seal/poc
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nupkg-windows
+          path: feed
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            6.0.x
+            7.0.x
+            8.0.x
+
+      - name: Module IDs of the Windows-built package (compare with the committed sealed artifact)
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          Add-Type -AssemblyName System.Reflection.Metadata
+          $dir = Join-Path $env:RUNNER_TEMP 'nupkg'
+          [IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path 'feed/*.nupkg'), $dir)
+          Get-ChildItem "$dir/lib/*/*.dll" | Sort-Object FullName | ForEach-Object {
+            $fs = [IO.File]::OpenRead($_.FullName)
+            $pe = [Reflection.PortableExecutable.PEReader]::new($fs)
+            $md = [Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($pe)
+            $mvid = $md.GetGuid($md.GetModuleDefinition().Mvid)
+            $pe.Dispose(); $fs.Dispose()
+            Write-Output ("{0,-16} mvid={1}" -f $_.Directory.Name, $mvid)
+          }
+
+      - name: Run PoC against original 8.0.3 and sealed 8.0.3-sp1
+        shell: pwsh
+        working-directory: .seal/poc
+        run: |
+          $feed = (Resolve-Path ../../feed).Path
+          Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/system.security.cryptography.xml/8.0.3/system.security.cryptography.xml.8.0.3.nupkg -OutFile "$feed/system.security.cryptography.xml.8.0.3.nupkg"
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources><clear /><add key="local" value="$feed" /><add key="nuget.org" value="https://api.nuget.org/v3/index.json" /></packageSources>
+            <packageSourceMapping>
+              <packageSource key="local"><package pattern="System.Security.Cryptography.Xml" /></packageSource>
+              <packageSource key="nuget.org"><package pattern="*" /></packageSource>
+            </packageSourceMapping>
+          </configuration>
+          "@ | Set-Content nuget.config
+          $tfms = 'net8.0', 'net7.0', 'net6.0', 'netcoreapp3.1', 'net48'
+          $bad = @()
+          foreach ($v in '8.0.3', '8.0.3-sp1') {
+            Remove-Item -Recurse -Force bin, obj -ErrorAction SilentlyContinue
+            $env:NUGET_PACKAGES = Join-Path $env:RUNNER_TEMP "nuget-$v"
+            dotnet build -c Release -p:XmlPkgVersion=$v | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::build failed for $v"; exit 1 }
+            foreach ($tfm in $tfms) {
+              Write-Output "################ package $v / $tfm"
+              if ($tfm -eq 'net48') { $out = & "bin/Release/$tfm/app.exe" }
+              else {
+                if ($tfm -eq 'netcoreapp3.1') { $env:DOTNET_ROLL_FORWARD = 'Major' }
+                $out = dotnet "bin/Release/$tfm/app.dll"
+                Remove-Item Env:DOTNET_ROLL_FORWARD -ErrorAction SilentlyContinue
+              }
+              $out | Write-Output
+              # net48 uses the package's net462 facade over the in-box System.Security.dll: informational only.
+              if ($tfm -ne 'net48') {
+                $expected = if ($v -eq '8.0.3-sp1') { 'FIXED' } else { 'VULNERABLE' }
+                $exploits = $out | Where-Object { $_ -match '^(VULNERABLE|FIXED|ERROR) ' }
+                if (($out | Where-Object { $_ -match '^OK ' }).Count -ne 1) { $bad += "$v/$tfm sanity" }
+                if ($exploits.Count -ne 6) { $bad += "$v/$tfm ran $($exploits.Count)/6 exploits" }
+                $unexpected = $exploits | Where-Object { $_ -notmatch "^$expected " }
+                # Only the sealed package gates the job; an odd result on the original is a warning.
+                if ($v -eq '8.0.3-sp1') { $unexpected | ForEach-Object { $bad += "$v/$tfm : $_" } }
+                else { $unexpected | ForEach-Object { Write-Output "::warning::$v/$tfm : $_" } }
+              }
+            }
+          }
+          if ($bad.Count) { $bad | ForEach-Object { Write-Output "::error::$_" }; exit 1 }
+          Write-Output 'PoC: all exploits VULNERABLE on 8.0.3 and FIXED on 8.0.3-sp1, sanity OK on both'

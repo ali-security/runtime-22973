@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net8.0;net7.0;net6.0;netcoreapp3.1</TargetFrameworks>
+    <!-- .NET Framework: the package's net462 asset is a facade over the in-box System.Security.dll -->
+    <TargetFrameworks Condition="'$(OS)' == 'Windows_NT'">$(TargetFrameworks);net48</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <CheckEolTargetFramework>false</CheckEolTargetFramework>
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+    <NoWarn>$(NoWarn);NU1902;NU1903;NU1904;SYSLIB0026;SYSLIB0027;SYSLIB0028</NoWarn>
+    <XmlPkgVersion Condition="'$(XmlPkgVersion)' == ''">8.0.3-sp1</XmlPkgVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="[$(XmlPkgVersion)]" />
+  </ItemGroup>
+</Project>

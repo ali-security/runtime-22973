@@ -117,9 +117,12 @@ jobs:
 
       - name: Run PoC against original 8.0.3 and sealed 8.0.3-sp1
         shell: pwsh
-        working-directory: .seal/poc
         run: |
-          $feed = (Resolve-Path ../../feed).Path
+          $feed = (Resolve-Path feed).Path
+          # Build outside the runtime tree, or MSBuild imports its Directory.Build.props (Arcade).
+          $poc = Join-Path $env:RUNNER_TEMP 'poc'
+          Copy-Item -Recurse .seal/poc $poc
+          Set-Location $poc
           Invoke-WebRequest https://api.nuget.org/v3-flatcontainer/system.security.cryptography.xml/8.0.3/system.security.cryptography.xml.8.0.3.nupkg -OutFile "$feed/system.security.cryptography.xml.8.0.3.nupkg"
           @"
           <?xml version="1.0" encoding="utf-8"?>
